@@ -217,6 +217,18 @@ impl GrpcBusClient {
             }
         }
 
+        // Refuse to allocate more than MAX_PROTOBUF_BODY_BYTES for the
+        // response: a malicious or misbehaving server could otherwise send an
+        // arbitrarily large Content-Length header and OOM the client.
+        if content_length > MAX_PROTOBUF_BODY_BYTES {
+            error!(
+                content_length,
+                max = MAX_PROTOBUF_BODY_BYTES,
+                "gRPC response Content-Length exceeds limit; refusing to allocate"
+            );
+            return Err(BusError::BusClosed);
+        }
+
         // Read body
         let mut body_buf = vec![0u8; content_length];
         if content_length > 0 {
@@ -925,5 +937,44 @@ mod tests {
         let decoded = SubscribeRequest::decode(Bytes::from(buf)).unwrap();
         assert_eq!(decoded.agent_id, "agent-1");
         assert_eq!(decoded.topics.len(), 2);
+    }
+
+    /// A server that advertises an enormous Content-Length must not trick
+    /// the client into pre-allocating that many bytes; the client should
+    /// reject the response before touching memory.
+    #[tokio::test]
+    async fn test_client_rejects_oversized_response_content_length() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            // Drain the client's request so it does not stall on write.
+            let mut sink = [0u8; 1024];
+            let _ = socket.read(&mut sink).await;
+            // Advertise a body far larger than MAX_PROTOBUF_BODY_BYTES but
+            // send no body. The client must refuse without allocating.
+            let oversized = MAX_PROTOBUF_BODY_BYTES as u64 + 1;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 content-type: application/x-protobuf\r\n\
+                 content-length: {oversized}\r\n\
+                 \r\n"
+            );
+            use tokio::io::AsyncWriteExt;
+            let _ = socket.write_all(resp.as_bytes()).await;
+        });
+
+        let ep = GrpcBusEndpoint::new(format!("127.0.0.1:{port}"));
+        let client = GrpcBusClient::new(ep);
+        let err = client
+            .send_request("/agentos.bus.v1.AgentBus/Publish", b"ignored")
+            .await
+            .expect_err("oversized Content-Length must be rejected");
+        assert!(matches!(err, BusError::BusClosed));
+        let _ = server.await;
     }
 }
